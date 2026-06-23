@@ -1,0 +1,8 @@
+# Simulation outputs
+*.vcd
+*.vvp
+
+# Compiled binaries
+uart_tb
+uart_rx
+uart_tx
