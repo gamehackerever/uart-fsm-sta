@@ -1,6 +1,7 @@
 # Simulation outputs
 *.vcd
 *.vvp
+*.out
 
 # Compiled binaries
 uart_tb

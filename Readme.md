@@ -2,9 +2,9 @@
 
 A fully functional UART (Universal Asynchronous Receiver-Transmitter) controller designed from scratch in Verilog HDL as explicit Finite State Machines (FSMs), synthesized to a gate-level netlist using Yosys targeting the open-source SkyWater Sky130 standard cell library, and analyzed for timing closure using OpenSTA.
 
-**Tools:** Icarus Verilog · GTKWave · Yosys · OpenSTA · SkyWater Sky130 PDK  
-**Language:** Verilog HDL  
-**Status:** Week 1 complete (RTL + Verification) — Synthesis & STA in progress
+**Tools:** Icarus Verilog · GTKWave · Yosys · OpenSTA · SkyWater Sky130 PDK
+**Language:** Verilog HDL
+**Status:** RTL + Verification complete (CDC-safe, 8x oversampled, self-checking loopback test passing) — Synthesis & STA in progress
 
 ---
 
@@ -14,6 +14,7 @@ A fully functional UART (Universal Asynchronous Receiver-Transmitter) controller
 - [FSM Design](#fsm-design)
 - [File Structure](#file-structure)
 - [Simulation & Verification](#simulation--verification)
+- [Design Decisions & Bugs Found](#design-decisions--bugs-found)
 - [Synthesis](#synthesis)
 - [Static Timing Analysis](#static-timing-analysis)
 - [How to Run](#how-to-run)
@@ -24,9 +25,10 @@ A fully functional UART (Universal Asynchronous Receiver-Transmitter) controller
 
 UART is a serial communication protocol that transmits data one bit at a time over a single wire. This project implements:
 
-- **UART TX** — takes a parallel 8-bit input and serializes it: idle → start bit (low) → 8 data bits (LSB first) → stop bit (high)
-- **UART RX** — deserializes an incoming bit stream back into an 8-bit parallel output, with start-bit detection and stop-bit validation
-- **UART Top** — wires TX and RX together; in loopback mode the TX output connects directly to RX input
+- **UART TX** — takes a parallel 8-bit input and serializes it: idle → start bit (low) → 8 data bits (LSB first) → stop bit (high). Exposes a `busy` flag so a caller can't accidentally retrigger a transmission mid-byte.
+- **UART RX** — deserializes an incoming, asynchronous bit stream back into an 8-bit parallel output. The `rx` line is passed through a 2-flop synchronizer before it touches any FSM logic, and each bit is sampled 8 times (oversampled) with a majority vote, making reception robust to line noise and sampling jitter. A one-cycle `data_valid` strobe marks exactly when a byte is ready.
+- **Baud rate generator** — a parameterized clock divider (`CLK_FREQ`, `BAUD_RATE`) that produces both an 8x tick (drives RX oversampling) and a 1x tick derived from it (drives TX, one bit per baud period), so TX and RX stay phase-locked to the same source instead of assuming an externally supplied baud clock.
+- **UART Top** — wires the baud generator, TX, and RX together into a single instantiable module.
 
 The primary goal of this project is not just functional correctness but to demonstrate a complete **digital design flow**: RTL → functional verification → synthesis → static timing analysis → timing closure.
 
@@ -35,15 +37,25 @@ The primary goal of this project is not just functional correctness but to demon
 ## Architecture
 
 ```
+                        ┌───────────────┐
+                        │   baud_gen    │
+                        │ (CLK_FREQ,    │
+                        │  BAUD_RATE)   │
+                        └───┬───────┬───┘
+                     tick_1x│       │tick_8x
+                            ▼       ▼
           ┌─────────────┐        tx (serial)       ┌─────────────┐
 data_in ──►   UART TX   ├──────────────────────────►   UART RX   ├──► data_out
-start   ──►   (FSM)     │                           │   (FSM)     │
-          └──────┬──────┘                           └──────┬──────┘
-                 │                                         │
-              baud_clk                                  baud_clk
+start   ──►   (FSM)     │                           │   (FSM)     ├──► data_valid
+busy    ◄───┤           │                           │             │
+          └─────────────┘                           └──────┬──────┘
+                                                             │
+                                                        rx (async in)
+                                                     2-flop synchronizer
+                                                        before FSM logic
 ```
 
-Both TX and RX are clocked by the same baud clock. In a real system, a baud rate generator module divides the system clock down to the target baud rate (e.g., 50 MHz ÷ 9600 = ~5208 clock cycles per bit period).
+`uart_top.v` instantiates all three blocks above. In loopback testing, `tx` is tied directly to `rx`.
 
 ---
 
@@ -52,42 +64,43 @@ Both TX and RX are clocked by the same baud clock. In a real system, a baud rate
 ### TX State Machine
 
 ```
-        tx_start=1
+        start=1 && !busy
   ┌──────────────────┐
   │                  ▼
 IDLE ──────────► START ──────────► DATA ──────────► STOP
   ▲   tx=1         tx=0        tx=data[bit]    tx=1    │
-  │                                bit_cnt++           │
+  │   busy=0                      bit_cnt++   busy=0    │
   └────────────────────────────────────────────────────┘
                                   (bit_cnt==7 → STOP)
 ```
 
 | State | Action |
 |-------|--------|
-| IDLE  | Hold `tx=1` (line idle high); wait for `tx_start` |
+| IDLE  | Hold `tx=1` (line idle high); latch `data` and raise `busy` on `start` (ignored if already `busy`) |
 | START | Drive `tx=0` for one baud period (start bit) |
-| DATA  | Shift out `data[0]` through `data[7]`, LSB first, one bit per baud clock |
-| STOP  | Drive `tx=1` for one baud period (stop bit), return to IDLE |
+| DATA  | Shift out `data[0]` through `data[7]`, LSB first, one bit per `tick_1x` |
+| STOP  | Drive `tx=1` for one baud period (stop bit), clear `busy`, return to IDLE |
 
 ### RX State Machine
 
 ```
-        rx==0 (falling edge)
+   rx_sync==0 (after 2-flop sync)
   ┌──────────────────┐
   │                  ▼
 IDLE ──────────► START ──────────► DATA ──────────► STOP
-  ▲   rx=1     sample bit[0]   data[bit_cnt]=rx  check rx=1  │
-  │                                bit_cnt++                  │
-  └───────────────────────────────────────────────────────────┘
+  ▲   rx=1      8x oversample +  8x oversample +   8x oversample,   │
+  │             majority vote    majority vote      data_valid=1    │
+  │             (verify start)   per bit, bit_cnt++                 │
+  └───────────────────────────────────────────────────────────────┘
                                   (bit_cnt==7 → STOP)
 ```
 
 | State | Action |
 |-------|--------|
-| IDLE  | Wait for `rx` to go low (start bit detection) |
-| START | Sample `data[0]`, begin reception |
-| DATA  | Sample `data[1]` through `data[7]` on each baud clock posedge |
-| STOP  | Validate stop bit (`rx==1`); return to IDLE |
+| IDLE  | Wait for the *synchronized* `rx` to go low (start bit detection) |
+| START | Sample 8 times at `tick_8x`; majority-vote confirms it's a real start bit, not a glitch |
+| DATA  | For each of 8 data bits: sample 8 times, majority-vote the value into `data[bit_cnt]` |
+| STOP  | Sample 8 times, then pulse `data_valid` for one cycle and return to IDLE |
 
 ---
 
@@ -95,17 +108,20 @@ IDLE ──────────► START ──────────► D
 
 ```
 uart_project/
-├── uart_tx.v          # UART transmitter FSM
-├── uart_rx.v          # UART receiver FSM
-├── uart_top.v         # Top-level module (TX + RX + loopback)
-├── uart_tx_tb.v       # TX testbench
-├── uart_rx_tb.v       # RX testbench
-├── uart_top_tb.v      # Loopback testbench (TX output → RX input)
-├── synth.ys           # Yosys synthesis script
-├── constraints.sdc    # Timing constraints for OpenSTA
-├── sta_run.tcl        # OpenSTA script
+├── baud_gen.v          # Parameterized baud rate generator (8x + 1x ticks)
+├── uart_tx.v            # UART transmitter FSM (with busy flag)
+├── uart_rx.v            # UART receiver FSM (synchronizer + 8x majority vote + data_valid)
+├── uart_top.v            # Top-level module: baud_gen + TX + RX wired together
+├── uart_tx_tb.v          # Standalone TX testbench
+├── uart_rx_tb.v          # Standalone RX testbench
+├── tb_uart_loopback.v    # Self-checking top-level loopback testbench (replaces manual waveform inspection)
+├── synth.ys              # Yosys synthesis script
+├── constraints.sdc       # Timing constraints for OpenSTA
+├── sta_run.tcl           # OpenSTA script
 └── README.md
 ```
+
+> `uart_top.v` and `baud_gen.v` are new additions — earlier versions of this project had only the standalone TX and RX modules with their own testbenches and no integrated top-level or baud generator.
 
 ---
 
@@ -113,31 +129,31 @@ uart_project/
 
 ### Loopback Test
 
-The key verification test connects TX output directly to RX input and confirms that every byte transmitted is correctly received. The waveform below shows a loopback simulation:
+`tb_uart_loopback.v` ties `tx` directly to `rx` and automatically checks every received byte against what was sent — no manual waveform reading required to confirm a pass. It exercises both data-pattern coverage and a control-path edge case:
 
-- `data_in` — byte fed to TX
-- `tx` — serial line (start bit low, 8 data bits, stop bit high)
-- `data_out` — byte recovered by RX after full transmission
+| Test | Description | Result |
+|------|-------------|--------|
+| 0x00 | All-zero byte | ✓ |
+| 0xFF | All-one byte | ✓ |
+| 0xA5 | Alternating pattern (10100101) | ✓ |
+| 0x5A | Alternating pattern (01011010) | ✓ |
+| 0x4B | Arbitrary ASCII byte | ✓ |
+| Busy contention | `start` pulsed again while a transmission is already in progress; confirms it's correctly ignored and the in-flight byte isn't corrupted | ✓ |
 
-**Loopback waveform — `data_in = 0x88`, received `data_out = 0x88` ✓**
-<img width="1787" height="231" alt="image" src="https://github.com/user-attachments/assets/3e81223a-b43e-41fd-9a35-6aa8e7a4a7cd" />
-<img width="1813" height="230" alt="image" src="https://github.com/user-attachments/assets/c695c8b9-0409-4db4-bac4-a38c8bd6e766" />
+```
+=== ALL TESTS PASSED ===
+```
 
-Test vectors verified:
+---
 
-| data_in | Expected data_out | Result |
-|---------|-------------------|--------|
-| 0x88    | 0x88              | ✓      |
-| 0xC9    | 0xC9              | ✓      |
-| 0xFB    | 0xFB              | ✓      |
-| 0xDF    | 0xDF              | ✓      |
-| 0xED    | 0xED              | ✓      |
-| 0xCA    | 0xCA              | ✓      |
+## Design Decisions & Bugs Found
 
-### Known Design Decisions
-
-- **Sampling point:** RX samples at the rising edge of the baud clock. In a real asynchronous system, mid-bit sampling using an oversampling clock (8x or 16x baud rate) would be used to avoid edge jitter. This is a planned improvement.
-- **No parity bit:** Currently implements 8N1 format (8 data bits, no parity, 1 stop bit).
+- **8x oversampling with majority vote** (implemented, not just planned): `rx` is sampled 8 times per bit and the majority value is taken, so a single noisy or mistimed sample can't flip a bit. This also naturally rejects short glitches that aren't real start bits.
+- **Clock domain crossing:** `rx` is asynchronous to the system clock. Sampling it directly risks metastability — if `rx` transitions right at a flop's setup/hold window, the output can resolve unpredictably. A 2-flop synchronizer sits between the raw `rx` pin and all FSM logic, giving any metastable value a full clock cycle to settle before it's used.
+- **`data_valid` strobe:** added because the RX FSM previously had no way to tell a downstream consumer *when* a byte was actually ready — `data` would just change value with no signal to sample it on.
+- **`busy` flag on TX:** added so a caller can't retrigger a new transmission mid-byte by holding or re-pulsing `start`; verified explicitly in the loopback testbench.
+- **Bug found via simulation — vote register width:** the majority-vote accumulator (`vote`) was originally 3 bits wide (max value 7). When a bit is a clean, consistent `1` across all 8 oversamples, `vote + rx_sync` reaches **8**, which needs 4 bits. Because the comparison was against a 3-bit constant, the sum was computed at 3-bit width and silently truncated (8 → 0), misreading a solid `1` bit as `0`. This didn't show up in code review — it only appeared once the self-checking loopback testbench was run against real data patterns. Fixed by widening `vote` to 4 bits. This is the reason the testbench asserts against expected values automatically rather than relying on eyeballing a waveform.
+- **8N1 format:** 8 data bits, no parity, 1 stop bit.
 
 ---
 
@@ -145,7 +161,7 @@ Test vectors verified:
 
 *(To be completed — Week 2)*
 
-Synthesis target: **SkyWater Sky130 HD standard cell library** (`sky130_fd_sc_hd__tt_025C_1v80.lib`)  
+Synthesis target: **SkyWater Sky130 HD standard cell library** (`sky130_fd_sc_hd__tt_025C_1v80.lib`)
 Tool: **Yosys 0.66**
 
 ```bash
@@ -163,7 +179,7 @@ Results will include:
 
 *(To be completed — Week 3)*
 
-Tool: **OpenSTA**  
+Tool: **OpenSTA**
 Target clock: TBD MHz (will be determined by synthesis results)
 
 Analysis will include:
@@ -187,25 +203,25 @@ source oss-cad-suite/environment
 . "D:\oss-cad-suite\environment.ps1"
 ```
 
-### Simulate TX
+### Simulate TX (standalone)
 ```bash
 iverilog -o uart_tx_tb uart_tx.v uart_tx_tb.v
 vvp uart_tx_tb
 gtkwave uart_tx_wf.vcd
 ```
 
-### Simulate RX
+### Simulate RX (standalone)
 ```bash
 iverilog -o uart_rx_tb uart_rx.v uart_rx_tb.v
 vvp uart_rx_tb
 gtkwave uart_rx_wf.vcd
 ```
 
-### Simulate Loopback (TX → RX)
+### Simulate full loopback (baud_gen + TX + RX, self-checking)
 ```bash
-iverilog -o uart_top_tb uart_tx.v uart_rx.v uart_top.v uart_top_tb.v
-vvp uart_top_tb
-gtkwave uart_top_wf.vcd
+iverilog -o sim.out baud_gen.v uart_rx.v uart_tx.v uart_top.v tb_uart_loopback.v
+vvp sim.out
+gtkwave uart_loopback.vcd
 ```
 
 ### Synthesize
@@ -222,7 +238,7 @@ sta sta_run.tcl
 
 ## Author
 
-**Srinand E K**  
-B.Tech, Electronics & Communication Engineering  
-National Institute of Technology, Calicut (2023–2027)  
+**Srinand E K**
+B.Tech, Electronics & Communication Engineering
+National Institute of Technology, Calicut (2023–2027)
 [github.com/gamehackerever](https://github.com/gamehackerever)
